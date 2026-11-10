@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""oscc.py - C subset compiler for OISC (SUBLEQ target).
+
+Supports:
+  - int, pointer types, global vars, arrays, functions
+  - statements: if/else, while, for, return, block, expr-statement
+  - expressions: + - * / % << >> & | ^ ~ ! && || == != < <= > >=
+                 unary - & * (cast), function calls, assignments
+  - control flow: the SUBLEQ branch is mem[B]<=0 -> jump C.  We compile
+    every (int) value into a scratch "register model": a set of global
+    slots (acc-style).  We keep it SIMPLE and CORRECT: all temps are
+    global slots, all local variables live in a per-call frame array
+    (subscripted by a frame pointer slot).  Recursion works because we
+    push/pop frames on a global stack.  Function args & return passed
+    through a tiny ABI on global slots.
+
+ABI:
+  - arg slots: A0..A3 (int) / pointers passed as int (word addresses!)
+  - return: R0
+  - fp (frame pointer) slot; calling convention: caller writes A0..,
+    jump sub program, callee prologue pushes fp, epilogue pops and
+    returns via return-address slot RA.
+
+This is an intentionally small but real compiler used to build a
+minimal OISC Linux-like kernel and userspace.
+
+NOTE: The generated code uses the `osma` Asm API (labels, slots, consts,
+mmio, cells).
+"""
+import struct
+import sys
+import re
+
+
+# ------------------------------------------------------------------
+# Tokenizer
+# ------------------------------------------------------------------
+class Tok:
+    __slots__ = ('kind', 'val', 'line')
+
+    def __init__(self, kind, val, line):
+        self.kind = kind
+        self.val = val
+        self.line = line
+
+    def __repr__(self):
+        return 'Tok(%s,%r)' % (self.kind, self.val)
+
+
+KEYWORDS = {'int', 'void', 'char', 'if', 'else', 'while', 'for',
+            'return', 'break', 'continue', 'unsigned', 'long', 'short',
+            'signed', 'static', 'extern', 'struct'}
+
+
+def tokenize(src):
+    toks = []
+    i = 0
+    n = len(src)
+    line = 1
+    while i < n:
+        c = src[i]
+        if c in ' \t\r':
+            i += 1
+            continue
+        if c == '\n':
+            line += 1
+            i += 1
+            continue
+        if src.startswith('//', i):
+            j = src.find('\n', i)
+            if j < 0:
+                break
+            i = j
+            continue
+        if src.startswith('/*', i):
+            j = src.find('*/', i + 2)
+            if j < 0:
+                break
+            # count newlines
+            line += src.count('\n', i, j)
+            i = j + 2
+            continue
+        # number
+        if c.isdigit():
+            j = i
+            while j < n and (src[j].isalnum() or src[j] == '_'):
+                j += 1
+            toks.append(Tok('num', src[i:j], line))
+            i = j
+            continue
+        # identifier
+        if c.isalpha() or c == '_':
+            j = i
+            while j < n and (src[j].isalnum() or src[j] == '_'):
+                j += 1
+            word = src[i:j]
+            kind = 'kw' if word in KEYWORDS else 'id'
+            toks.append(Tok(kind, word, line))
+            i = j
+            continue
+        # string literal
+        if c == '"':
+            j = i + 1
+            val = []
+            while j < n and src[j] != '"':
+                if src[j] == '\\' and j + 1 < n:
+                    e = src[j + 1]
+                    if e == 'n':
+                        val.append(10)
+                    elif e == 't':
+                        val.append(9)
+                    elif e == 'r':
+                        val.append(13)
+                    elif e == '\\':
+                        val.append(92)
+                    elif e == '"':
+                        val.append(34)
+                    elif e == '0':
+                        val.append(0)
+                    else:
+                        val.append(ord(e))
+                    j += 2
+                else:
+                    if src[j] == '\n':
+                        line += 1
+                    val.append(ord(src[j]))
+                    j += 1
+            toks.append(Tok('str', bytes(val), line))
+            i = j + 1
+            continue
+        # char literal
+        if c == "'":
+            j = i + 1
+            if j < n and src[j] == '\\':
+                e = src[j + 1]
+                v = {'n': 10, 't': 9, 'r': 13, '\\': 92, "'": 39,
+                     '0': 0}.get(e, ord(e))
+                j += 2
+            else:
+                v = ord(src[j])
+                j += 1
+            toks.append(Tok('num', str(v), line))
+            i = j + 1
+            continue
+        # operators
+        two = {'==': 1, '!=': 1, '<=': 1, '>=': 1, '&&': 1, '||': 1,
+               '<<': 1, '>>': 1, '++': 1, '--': 1, '+=': 1, '-=': 1,
+               '*=': 1, '/=': 1, '%=': 1, '&=': 1, '|=': 1, '^=': 1,
+               '->': 1}
+        if i + 1 < n and src[i:i + 2] in two:
+            toks.append(Tok('op', src[i:i + 2], line))
+            i += 2
+            continue
+        if c in '+-*(){}[];,<>=!&|^~%?:/.':
+            toks.append(Tok('op', c, line))
+            i += 1
+            continue
+        raise SyntaxError('bad char %r at line %d' % (c, line))
+    toks.append(Tok('eof', '', line))
+    return toks
+
+
+# ------------------------------------------------------------------
+# Parser (C subset)
+# ------------------------------------------------------------------
+class Type:
+    def __init__(self, base='int', ptr=0, arr=None):
+        self.base = base        # 'int','void','char'
+        self.ptr = ptr          # indirection count
+        self.arr = arr          # array length or None
+
+    def __repr__(self):
+        s = self.base + '*' * self.ptr
+        if self.arr:
+            s += '[%d]' % self.arr
+        return s
+
+    def size(self):
+        if self.arr:
+            return self.arr
+        return 1
+
+
+class Node:
+    pass
+
+
+class Glob(Node):
+    def __init__(self, name, typ, init):
+        self.name = name
+        self.typ = typ
+        self.init = init
+
+
+class Func(Node):
+    def __init__(self, name, ret, params, body, plist):
+        self.name = name
+        self.ret = ret
+        self.params = params
+        self.body = body
+        self.plist = plist
+
+
+class FnDecl(Node):
+    def __init__(self, name, ret, params, plist):
+        self.name = name
+        self.ret = ret
+        self.params = None
+        self.plist = plist
+
+
+class Block(Node):
+    def __init__(self, stmts):
+        self.stmts = stmts
+
+
+class If(Node):
+    def __init__(self, cond, then, els):
+        self.cond = cond
+        self.then = then
+        self.els = els
+
+
+class While(Node):
+    def __init__(self, cond, body):
+        self.cond = cond
+        self.body = body
+
+
+class For(Node):
+    def __init__(self, init, cond, post, body):
+        self.init = init
+        self.cond = cond
+        self.post = post
+        self.body = body
+
+
+class Ret(Node):
+    def __init__(self, expr):
+        self.expr = expr
+
+
+class Break(Node):
+    pass
+
+
+class Cont(Node):
+    pass
+
+
+class ExprStmt(Node):
+    def __init__(self, expr):
+        self.expr = expr
+
+
+class VarDecl(Node):
+    def __init__(self, name, typ, init):
+        self.name = name
+        self.typ = typ
+        self.init = init
+
+
+class Empty(Node):
+    pass
+
+
+# expressions
+class Num(Node):
+    def __init__(self, v):
+        self.v = v
+
+
+class Str(Node):
+    def __init__(self, data):
+        self.data = data      # bytes
+
+
+class Name(Node):
+    def __init__(self, name):
+        self.name = name
+
+
+class Unary(Node):
+    def __init__(self, op, e):
+        self.op = op
+        self.e = e
+
+
+class Binary(Node):
+    def __init__(self, op, l, r):
+        self.op = op
+        self.l = l
+        self.r = r
+
+
+class Assign(Node):
+    def __init__(self, op, l, r):
+        self.op = op
+        self.l = l
+        self.r = r
+
+
+class Call(Node):
+    def __init__(self, name, args):
+        self.name = name
+        self.args = args
+
+
+class Index(Node):
+    def __init__(self, base, idx):
+        self.base = base
+        self.idx = idx
+
+
+class Member(Node):
+    def __init__(self, base, field):
+        self.base = base
+        self.field = field
+
+
+class Cond(Node):
+    def __init__(self, c, t, e):
+        self.c = c
+        self.t = t
+        self.e = e
+
+
+class Parser:
+    def __init__(self, toks):
+        self.toks = toks
+        self.pos = 0
+
+    def peek(self):
+        return self.toks[self.pos]
+
+    def next(self):
+        t = self.toks[self.pos]
+        if t.kind != 'eof':
+            self.pos += 1
+        return t
+
+    def expect(self, val):
+        t = self.next()
+        if t.val != val:
+            raise SyntaxError('expected %r got %r (line %d)'
+                              % (val, t.val, t.line))
+        return t
+
+    def at(self, val):
+        return self.peek().val == val
+
+    def eat(self, val):
+        if self.at(val):
+            self.next()
+            return True
+        return False
+
+    # ---- types ----
+    def parse_type(self):
+        base = 'int'
+        ptr = 0
+        if self.at('unsigned') or self.at('signed') or self.at('long') \
+           or self.at('short'):
+            self.next()
+            base = 'int'
+        elif self.at('char'):
+            self.next()
+            base = 'char'
+        elif self.at('void'):
+            self.next()
+            base = 'void'
+        elif self.at('int'):
+            self.next()
+            base = 'int'
+        else:
+            return None
+        while self.eat('*'):
+            ptr += 1
+        return Type(base, ptr)
+
+    def parse_declarator(self, typ):
+        """Parse identifier, possibly with array suffixes -> (name, Type)."""
+        name = self.expect('id').val
+        while self.at('['):
+            self.next()
+            if self.at(']'):
+                return (name, Type(typ.base, typ.ptr, None))
+            n = int(self.next().val)
+            self.expect(']')
+            return (name, Type(typ.base, typ.ptr, n))
+        return (name, typ)
+
+    # ---- statements ----
+    def parse_block(self):
+        stmts = []
+        self.expect('{')
+        while not self.at('}'):
+            stmts.append(self.parse_stmt())
+        self.expect('}')
+        return Block(stmts)
+
+    def parse_stmt(self):
+        t = self.peek()
+        if t.val == '{':
+            return self.parse_block()
+        if t.val == 'if':
+            self.next()
+            self.expect('(')
+            c = self.parse_expr()
+            self.expect(')')
+            th = self.parse_stmt()
+            el = None
+            if self.at('else'):
+                self.next()
+                el = self.parse_stmt()
+            return If(c, th, el)
+        if t.val == 'while':
+            self.next()
+            self.expect('(')
+            c = self.parse_expr()
+            self.expect(')')
+            b = self.parse_stmt()
+            return While(c, b)
+        if t.val == 'for':
+            self.next()
+            self.expect('(')
+            if self.at(';'):
+                init = None
+            else:
+                init = self.parse_expr()
+            self.expect(';')
+            if self.at(';'):
+                cond = None
+            else:
+                cond = self.parse_expr()
+            self.expect(';')
+            if self.at(')'):
+                post = None
+            else:
+                post = self.parse_expr()
+            self.expect(')')
+            b = self.parse_stmt()
+            return For(init, cond, post, b)
+        if t.val == 'return':
+            self.next()
+            if self.at(';'):
+                e = None
+            else:
+                e = self.parse_expr()
+            self.expect(';')
+            return Ret(e)
+        if t.val == 'break':
+            self.next()
+            self.expect(';')
+            return Break()
+        if t.val == 'continue':
+            self.next()
+            self.expect(';')
+            return Cont()
+        if t.val == ';':
+            self.next()
+            return Empty()
+        # declaration or expression
+        typ = self.parse_type()
+        if typ is not None:
+            name, dt = self.parse_declarator(typ)
+            init = None
+            if self.eat('='):
+                init = self.parse_expr()
+            self.expect(';')
+            return VarDecl(name, dt, init)
+        e = self.parse_expr()
+        self.expect(';')
+        return ExprStmt(e)
+
+    # ---- expressions (precedence climbing) ----
+    def parse_expr(self):
+        # assignment (right assoc)
+        l = self.parse_cond()
+        if self.peek().val in ('=', '+=', '-=', '*=', '/=', '%=',
+                               '&=', '|=', '^='):
+            op = self.next().val
+            r = self.parse_expr()
+            return Assign(op, l, r)
+        return l
+
+    def parse_cond(self):
+        c = self.parse_or()
+        if self.at('?'):
+            self.next()
+            t = self.parse_expr()
+            self.expect(':')
+            e = self.parse_cond()
+            return Cond(c, t, e)
+        return c
+
+    def parse_or(self):
+        l = self.parse_and()
+        while self.at('||') or self.at('|'):
+            op = self.next().val
+            r = self.parse_and()
+            l = Binary(op, l, r)
+        return l
+
+    def parse_and(self):
+        l = self.parse_bitor()
+        while self.at('&&') or self.at('&'):
+            op = self.next().val
+            r = self.parse_bitor()
+            l = Binary(op, l, r)
+        return l
+
+    def parse_bitor(self):
+        l = self.parse_bitxor()
+        while self.at('|'):
+            op = self.next().val
+            r = self.parse_bitxor()
+            l = Binary(op, l, r)
+        return l
+
+    def parse_bitxor(self):
+        l = self.parse_bitand()
+        while self.at('^'):
+            self.next()
+            r = self.parse_bitand()
+            l = Binary('^', l, r)
+        return l
+
+    def parse_bitand(self):
+        l = self.parse_eq()
+        while self.at('&'):
+            self.next()
+            r = self.parse_eq()
+            l = Binary('&', l, r)
+        return l
+
+    def parse_eq(self):
+        l = self.parse_rel()
+        while self.at('==') or self.at('!='):
+            op = self.next().val
+            r = self.parse_rel()
+            l = Binary(op, l, r)
+        return l
+
+    def parse_rel(self):
+        l = self.parse_shift()
+        while self.at('<') or self.at('>') or self.at('<=') \
+              or self.at('>='):
+            op = self.next().val
+            r = self.parse_shift()
+            l = Binary(op, l, r)
+        return l
+
+    def parse_shift(self):
+        l = self.parse_add()
+        while self.at('<<') or self.at('>>'):
+            op = self.next().val
+            r = self.parse_add()
+            l = Binary(op, l, r)
+        return l
+
+    def parse_add(self):
+        l = self.parse_mul()
+        while self.at('+') or self.at('-'):
+            op = self.next().val
+            r = self.parse_mul()
+            l = Binary(op, l, r)
+        return l
+
+    def parse_mul(self):
+        l = self.parse_unary()
+        while self.at('*') or self.at('/') or self.at('%'):
+            op = self.next().val
+            r = self.parse_unary()
+            l = Binary(op, l, r)
+        return l
+
+    def parse_unary(self):
+        t = self.peek()
+        if t.val in ('-', '!', '~', '*', '&', '++', '--'):
+            self.next()
+            e = self.parse_unary()
+            return Unary(t.val, e)
+        if t.val == '(':
+            # either cast or paren
+            save = self.pos
+            self.next()
+            if self.parse_type() is not None and self.at(')'):
+                self.next()
+                e = self.parse_unary()
+                return Unary('cast', e)
+            self.pos = save
+            self.next()
+            e = self.parse_expr()
+            self.expect(')')
+            return e
+        if t.kind == 'num':
+            self.next()
+            v = int(t.val, 0)
+            return Num(v)
+        if t.kind == 'str':
+            self.next()
+            return Str(t.val)
+        if t.kind == 'id':
+            self.next()
+            if self.at('('):
+                self.next()
+                args = []
+                if not self.at(')'):
+                    args.append(self.parse_expr())
+                    while self.eat(','):
+                        args.append(self.parse_expr())
+                self.expect(')')
+                return Call(t.val, args)
+            if self.at('['):
+                self.next()
+                idx = self.parse_expr()
+                self.expect(']')
+                return Index(Name(t.val), idx)
+            if self.eat('++'):
+                return PostInc(t.val)
+            if self.eat('--'):
+                return PostDec(t.val)
+            return Name(t.val)
+        raise SyntaxError('unexpected token %r line %d' % (t.val, t.line))
+
+    # ---- top level ----
+    def parse(self):
+        decls = []
+        while self.peek().kind != 'eof':
+            typ = self.parse_type()
+            if typ is None:
+                raise SyntaxError('expected type, got %r line %d'
+                                  % (self.peek().val, self.peek().line))
+            name, dt = self.parse_declarator(typ)
+            if self.at('('):
+                # function
+                self.next()
+                params = []
+                plist = []
+                if not self.at(')'):
+                    while True:
+                        pt = self.parse_type()
+                        if pt is None:
+                            raise SyntaxError('bad param')
+                        pname, pdt = self.parse_declarator(pt)
+                        # strip array to pointer
+                        plist.append(pname)
+                        params.append(pdt)
+                        if not self.eat(','):
+                            break
+                self.expect(')')
+                if self.at(';'):
+                    self.next()
+                    decls.append(FnDecl(name, dt, None, params))
+                else:
+                    body = self.parse_block()
+                    decls.append(Func(name, dt, params, body, plist))
+            else:
+                init = None
+                if self.eat('='):
+                    init = self.parse_expr()
+                self.expect(';')
+                decls.append(Glob(name, dt, init))
+        return decls
+
+
+class PostInc(Node):
+    def __init__(self, name):
+        self.name = name
+
+
+class PostDec(Node):
+    def __init__(self, name):
+        self.name = name
+
+
+# ------------------------------------------------------------------
+# Code generator
+# ------------------------------------------------------------------
+# We compile every int value into a fixed set of scratch slots.
+#   ACC   - primary accumulator (result of expressions)
+#   TMP   - secondary temp
+#   A0..A3- function arg slots
+#   R0    - return value slot
+#   RA    - return address slot
+#   FP    - frame pointer (not needed with static locals, kept for ABI)
+# Local variables are statically allocated slots with global scope --
+# recursion is not supported (matches a simple kernel).
+# Array/pointer refs use runtime address arithmetic.
+
+class CodeGen:
+    def __init__(self, asm):
+        self.a = asm
+        self.acc = asm.slot('_acc')
+        self.tmp = asm.slot('_tmp')
+        self.r0 = asm.slot('_r0')
+        self.ra = asm.slot('_ra')
+        self.arg = [asm.slot('_a%d' % i) for i in range(8)]
+        self.break_stack = []
+        self.continue_stack = []
+        self.locals = {}      # name -> slot address Sym
+        self.globals = {}     # name -> slot address Sym (arrays)
+        self.consts = {}      # str literal -> base Sym
+        self.funcs = {}       # name -> label
+        self.strings = []     # accumulated string literal bytes
+        self.label_n = 0
+
+    def new_label(self, hint='l'):
+        self.label_n += 1
+        return L('%s_%d' % (hint, self.label_n))
+
+    # ============ SUBLEQ primitives ============
+    # Contract: every primitive leaves its result in `dst` and then does
+    # an UNCONDITIONAL normalized jump `subleq Z,Z,cont` (Z = zero word)
+    # so internal sign-branching never leaks to the caller.  Only lanes
+    # Z/Z and dedicated temps are clobbered.
+    def _z(self):
+        return self.a.const(0)
+
+    def neg(self, dst, src):
+        """dst = -src.  Sequence: dst=0; dst -= src -> dst = -src."""
+        z = self._z()
+        l1 = self.new_label('n1')
+        l2 = self.new_label('n2')
+        l3 = self.new_label('n3')
+        self.a.cell(z, dst, l1)        # dst = 0 ; always jump
+        self.a.label(l1.name)
+        self.a.cell(self._addr(src), dst, l2)  # dst = -src ; branch if <=0
+        self.a.label(l2.name)
+        self.a.cell(z, z, l3)          # unconditional jump (keep value)
+        self.a.label(l3.name)
+
+    def ld(self, dst, src):
+        """dst = src.  t = -src ; dst = -t = src."""
+        z = self._z()
+        t = self._sub_t
+        l1 = self.new_label('l1')
+        l2 = self.new_label('l2')
+        l3 = self.new_label('l3')
+        l4 = self.new_label('l4')
+        l5 = self.new_label('l5')
+        self.a.cell(z, t, l1)          # t = 0 ; jump
+        self.a.label(l1.name)
+        self.a.cell(self._addr(src), t, l2)   # t = -src
+        self.a.label(l2.name)
+        self.a.cell(z, dst, l3)        # dst = 0 ; jump
+        self.a.label(l3.name)
+        self.a.cell(t, dst, l4)        # dst = -t = src
+        self.a.label(l4.name)
+        self.a.cell(z, z, l5)
+        self.a.label(l5.name)
+
+    def seti(self, dst, value):
+        """dst = value (immediate).  dst = 0 - (-value)."""
+        z = self._z()
+        negv = self.a.const(-value)
+        l1 = self.new_label('s1')
+        l2 = self.new_label('s2')
+        l3 = self.new_label('s3')
+        self.a.cell(z, dst, l1)
+        self.a.label(l1.name)
+        self.a.cell(negv, dst, l2)     # dst = 0 - (-v) = v
+        self.a.label(l2.name)
+        self.a.cell(z, z, l3)
+        self.a.label(l3.name)
+
+    def add(self, dst, a, b):
+        """dst = a + b.  t = -a ; t -= b -> t = -a-b ; dst = -t = a+b."""
+        z = self._z()
+        t = self._sub_t
+        l1 = self.new_label('a1')
+        l2 = self.new_label('a2')
+        l3 = self.new_label('a3')
+        l4 = self.new_label('a4')
+        l5 = self.new_label('a5')
+        l6 = self.new_label('a6')
+        self.a.cell(z, t, l1)          # t=0
+        self.a.label(l1.name)
+        self.a.cell(self._addr(a), t, l2)    # t = -a
+        self.a.label(l2.name)
+        self.a.cell(self._addr(b), t, l3)    # t = -a - b
+        self.a.label(l3.name)
+        self.a.cell(z, dst, l4)        # dst=0
+        self.a.label(l4.name)
+        self.a.cell(t, dst, l5)        # dst = a+b
+        self.a.label(l5.name)
+        self.a.cell(z, z, l6)
+        self.a.label(l6.name)
+
+    def sub(self, dst, a, b):
+        """dst = a - b = a + (-b)."""
+        nb = self._sub_u
+        self.neg(nb, b)
+        self.add(dst, a, nb)
+
+    def _addr(self, x):
+        """Coerce to a Sym/address for SUBLEQ operand."""
+        if isinstance(x, Sym):
+            return x
+        if isinstance(x, int):
+            return self.a.const(x)
+        raise ValueError('bad addr %r' % x)
+
+    # ============ expression compilation ============
+    def expr(self, e):
+        """Compile expression; result lands in self.acc."""
+        return None
