@@ -39,4 +39,11 @@ python3 sim.py /tmp/kernel.bin
 
 ## License
 
-MIT
+GPL-2.0-only
+
+本项目包含从 Linux 内核移植/改编的头文件与代码
+（`kernel_port/include/linux/*`、`kernel_port/include/asm/*`、`kernel_port/lib/delay.c` 等），
+这些文件保持 Linux 内核的 GPL-2.0-only 许可。其余自研代码（工具链 oscc/osma/sim、
+内核 arch/oisc 等）同样以 GPL-2.0-only 授权，与 Linux 内核许可证保持一致。
+
+参见 [LICENSE](LICENSE)。
