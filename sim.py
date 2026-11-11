@@ -22,6 +22,10 @@ class Sim:
         self.pc = 0
         self.halted = False
         self.out = bytearray()
+        self.disk = bytearray()      # virtual disk image (oisk_hd.bin)
+        self._cmd = 0
+        self._disk_stage = 0
+        self._disk_buf = 0
         if fw_words:
             self.mem[:len(fw_words)] = fw_words
 
@@ -41,11 +45,14 @@ class Sim:
     # MMIO word addresses (from oishw)
     W_TX = 0x3FFFC000
     W_RX = 0x3FFFC001
+    W_CMD = 0x3FFFC002
+    W_DAT = 0x3FFFC003
     W_RES = 0x3FFFC005
     W_CLK = 0x3FFFC007
     W_MX = 0x3FFFC009
     W_MY = 0x3FFFC00A
     W_MB = 0x3FFFC00B
+    W_DISK = 0x3FFFC00D
 
     def mmio_read(self, w):
         if w == self.W_RX:
@@ -59,8 +66,50 @@ class Sim:
         return 0   # TX etc read 0
 
     def mmio_write(self, w, val):
+        v = val & 0xffffffff
         if w == self.W_TX:
-            self.out.append(val & 0xff)
+            self.out.append(v & 0xff)
+        elif w == self.W_CMD:
+            # GPU/DISK command word.  GPU cmd 14 = DISK bufword op:
+            #   write CMD=14, then DAT=bufword, then DAT=op
+            #   op = lba | (nsec << 16) | (dir << 24), dir 1 = read to guest
+            self._cmd = v
+            self._disk_stage = 0
+        elif w == self.W_DAT:
+            if getattr(self, '_cmd', None) == 14:
+                if getattr(self, '_disk_stage', 0) == 0:
+                    self._disk_buf = v
+                    self._disk_stage = 1
+                elif self._disk_stage == 1:
+                    self._disk_stage = 0
+                    self._disk_exec(self._disk_buf, v)
+        # W_DISK direct op write: not the ko path (ko uses CMD/DAT)
+
+    def load_disk(self, path):
+        self.disk = bytearray(open(path, 'rb').read())
+        return len(self.disk)
+
+    def _disk_exec(self, bufword, op):
+        """Execute a DISK command (GPU cmd 14).
+        op = lba | (nsec << 16) | (dir << 24), dir 1 = read to guest.
+        Reads nsec sectors (512B each) from LBA lba into guest RAM words
+        starting at word address bufword.  Each sector is 128 words."""
+        nsec = (op >> 16) & 0xff
+        lba = op & 0xffff
+        direc = (op >> 24) & 0xff
+        if direc != 1 or not self.disk:
+            return
+        start = lba * 512
+        for sec in range(nsec):
+            off = start + sec * 512
+            src = self.disk[off:off + 512]
+            if len(src) < 512:
+                src += b'\0' * (512 - len(src))
+            words = list(struct.unpack('<128I', src))
+            base = bufword + sec * 128
+            for i, w in enumerate(words):
+                if base + i < len(self.mem):
+                    self.mem[base + i] = w & 0xffffffff
 
     def step(self):
         pc = self.pc
@@ -94,8 +143,10 @@ class Sim:
             if trace:
                 pc = self.pc
                 a = self.mem[pc]; b = self.mem[pc + 1]; c = self.mem[pc + 2]
+                va = self.mmio_read(a) if a >= len(self.mem) else self.mem[a]
+                vb = self.mmio_read(b) if b >= len(self.mem) else self.mem[b]
                 line = 'pc=%06x A=%08x B=%08x C=%08x  memA=%08x memB=%08x\n' % (
-                    pc, a, b, c, self.mem[a], self.mem[b])
+                    pc, a, b, c, va, vb)
                 if trace_to:
                     trace_to.write(line)
                 else:
