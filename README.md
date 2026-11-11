@@ -15,19 +15,29 @@ OISC（SUBLEQ）单指令集架构的内核骨架与自研 C 工具链。
   - `mm/alloc.c` — free-list 物理页分配器
   - `include/asm/` — 体系结构头文件
 - `kernel_port/` — Linux 内核文件移植骨架（头文件桥接）
+- `ko/` — ko 模块机制（core BIOS + elfloader.ko 内核 + init.elf 用户态）
+  - `build_ko.py` — 组装 core/elfloader.ko/init.elf 三级镜像与 512B 扇区磁盘
+  - `build_iso.py` — 把系统打包成可启动 ISO 9660 镜像（El Torito 启动目录）
+    oisk_hd.bin 放入 ISO System Area（字节 0..32767），ISO 文件区放
+    /OISK/BOOT.BIN、/OISK/ELFLDR.KO、/OISK/INIT.ELF 供浏览/挂载
 - `tests/` — 回归测试套件（`tests/run_all.sh` 一键全跑）
-
 ## 快速开始
-
 ```sh
 # 编译启动镜像
 python3 oscc.py -Ikernel/arch/oisc/include kernel/t_boot.c /tmp/kernel.bin
 
 # 模拟运行
 python3 sim.py /tmp/kernel.bin
-
 # 回归测试
 ./tests/run_all.sh
+
+# ko 机制（BIOS -> 内核 -> 用户态）
+python3 ko/build_ko.py            # 产出 core/ko/init + oisk_hd.bin
+python3 tests/ko_e2e_test.py      # 8/8 链路校验
+
+# 打包成 ISO
+python3 ko/build_iso.py           # 产出 oisk.iso（System Area 含启动盘）
+python3 tests/iso_e2e_test.py     # ISO 结构 + 内容 + 整链启动校验
 ```
 
 ## 特性

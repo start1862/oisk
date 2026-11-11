@@ -89,6 +89,15 @@ class Sim:
         self.disk = bytearray(open(path, 'rb').read())
         return len(self.disk)
 
+    def load_disk_iso(self, data):
+        """Register an in-memory ISO 9660 image as the virtual DISK
+        device.  The OISC kernel's DISK reads (512-byte sectors) hit the
+        ISO System Area (bytes 0..32767), which holds the verbatim
+        oisk_hd.bin boot disk, so the same ISO boots the ko chain
+        unchanged while remaining a standards-compliant ISO filesystem."""
+        self.disk = bytearray(data)
+        return len(self.disk)
+
     def _disk_exec(self, bufword, op):
         """Execute a DISK command (GPU cmd 14).
         op = lba | (nsec << 16) | (dir << 24), dir 1 = read to guest.
